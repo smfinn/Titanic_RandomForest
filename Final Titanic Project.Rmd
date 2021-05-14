@@ -1,0 +1,422 @@
+---
+title: "STAT 488 Final Titanic Project"
+author: "Sean Finn"
+date: "Due 5/3/2021"
+output: html_document
+---
+
+```{r Setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(randomForest)
+library(mice)
+library(caret)
+library(plyr)
+```
+
+## Methods
+
+1. Load the data
+
+```{r}
+train <- read_csv("train.csv")
+test  <- read_csv("test.csv")
+genderexample <- read_csv("gender_submission.csv")
+```
+
+2. Explore and visualize the data 
+
+```{r EDA}
+# Create histograms/bar charts for non-string variables
+bar_surv <- ggplot(data = train, aes(Survived)) +
+            geom_bar(aes(y=..prop..), fill = "mediumpurple") +
+            theme_classic() + scale_y_continuous(labels = scales::percent)
+bar_surv
+
+hist_class <- ggplot(data = train, aes(Pclass)) +
+              geom_bar(aes(y=..prop..), fill = "mediumpurple") +
+              theme_classic() + scale_y_continuous(labels = scales::percent)
+hist_class
+
+bar_sex <- ggplot(data = train, aes(Sex)) +
+           geom_bar(fill = "mediumpurple") +
+           theme_classic()
+bar_sex
+
+hist_age <- ggplot(data = train, aes(Age)) +
+              geom_histogram(fill = "mediumpurple", binwidth = 5) +
+              theme_classic()
+hist_age
+
+bar_sibs <- ggplot(data = train, aes(SibSp)) +
+            geom_bar(fill = "mediumpurple") +
+            theme_classic()
+bar_sibs
+
+bar_parch <- ggplot(data = train, aes(Parch)) +
+             geom_bar(fill = "mediumpurple") +
+             theme_classic()
+bar_parch
+
+hist_fare <- ggplot(data = train, aes(Fare)) +
+              geom_histogram(fill = "mediumpurple", binwidth = 10) +
+              theme_classic()
+hist_fare
+
+bar_emb <- ggplot(data = train, aes(Embarked)) +
+             geom_bar(fill = "mediumpurple") +
+             theme_classic()
+bar_emb
+
+# Identify missing data
+sum(is.na(train$Name))
+sum(is.na(train$Pclass))
+sum(is.na(train$Name))
+sum(is.na(train$Sex))
+sum(is.na(train$Age)) # Impute age for 177 passengers
+sum(is.na(train$SibSp))
+sum(is.na(train$Parch))
+sum(is.na(train$Ticket))
+sum(is.na(train$Fare))
+sum(is.na(train$Cabin)) # 687 missing values for cabin
+sum(is.na(train$Embarked)) # Impute embarked for 2 passengers
+
+# Take a look at character variables
+head(cbind(train$Name, train$Ticket, train$Cabin), 10)
+
+bar2_sex <- ggplot(data = train, aes(Survived)) +
+            geom_bar(aes(y=..prop.., fill = Sex), position = "dodge") +
+            theme_classic() + 
+            scale_y_continuous(labels = scales::percent) +
+            labs(title = "Titanic survival by gender", 
+                 y = "Percent", 
+            x = "Did not survive                                      Survived") 
+bar2_sex
+
+dataforplot <- train
+dataforplot$Survived <- as.factor(dataforplot$Survived)
+levels(dataforplot$Survived) <- c("Died", "Survived")
+
+hist_class <- ggplot(data = dataforplot, aes(Pclass)) +
+              geom_bar(aes(y=..prop.., fill = Pclass)) +
+              scale_y_continuous(labels = scales::percent) +
+              facet_grid(. ~ Survived) +
+              labs(title = "Titanic survival by passenger's ticket class",
+                   y = "Percent", x = "Passenger ticket class") +
+              theme_bw() 
+hist_class
+
+```
+
+3. Clean, perform recodes, and impute missing data
+
+```{r Imputation and recodes}
+# Prep for imputation
+train$Embarked <- as.factor(train$Embarked)
+train$Sex <- as.factor(train$Sex)
+
+# Impute missing age and embarkment data
+imputation <- mice(data = train[,c(2:10,12)], m = 1, method = c(rep("cart", 10)))
+train[,c(2:10,12)] <- complete(imputation)
+
+# Separate out name variable into parts
+train$title <- as.factor(str_extract(train$Name, "\\w+\\."))
+levels(train$title) # 17 unique titles
+train$lastname <- str_extract(train$Name, "\\w*")
+length(unique(train$lastname)) # 652 unique last names out of 891 passengers
+
+# Create new cabin variable - count the number listed (0 for NA)
+train$cabinct <- lengths(strsplit(train$Cabin, " "))
+train$cabinct <- ifelse(is.na(train$Cabin), 0, train$cabinct)
+
+# Create variable for first letter of cabin assignment
+train$cabin.first <- str_extract(train$Cabin, "[A-Z]")
+
+# Split ticket names into letters/prefix and numbers
+train$ticket.letters <- str_extract(train$Ticket, "\\D*")
+train$ticket.letters <- ifelse(train$ticket.letters=="", NA, train$ticket.letters)
+train$ticket.numbers <- str_extract(train$Ticket, "\\d*")
+train$ticket.numbers <- ifelse(train$ticket.numbers=="", 
+                               str_extract(train$Ticket, "\\s\\d*"), 
+                               train$ticket.numbers)
+train$ticket.numbers <- str_trim(train$ticket.numbers, side = "left")
+train$ticket.numbers <- as.numeric(train$ticket.numbers)
+
+# Remove NAs from training data
+train$Cabin <- ifelse(is.na(train$Cabin), "X", train$Cabin)
+train$cabin.first <- ifelse(is.na(train$cabin.first), "X", train$cabin.first)
+train$ticket.letters <- ifelse(is.na(train$ticket.letters), "X", train$ticket.letters)
+train$ticket.numbers <- ifelse(is.na(train$ticket.numbers), 000, train$ticket.numbers)
+```
+
+4. Fold training data and build starting model
+
+```{r Fold data for CV}
+train_folded <- createFolds(train$Survived, 8)
+train1 <- train[-train_folded$Fold1,]
+test1  <- train[ train_folded$Fold1,]
+train2 <- train[-train_folded$Fold2,]
+test2  <- train[ train_folded$Fold2,]
+train3 <- train[-train_folded$Fold3,]
+test3  <- train[ train_folded$Fold3,]
+train4 <- train[-train_folded$Fold4,]
+test4  <- train[ train_folded$Fold4,]
+train5 <- train[-train_folded$Fold5,]
+test5  <- train[ train_folded$Fold5,]
+train6 <- train[-train_folded$Fold6,]
+test6  <- train[ train_folded$Fold6,]
+train7 <- train[-train_folded$Fold7,]
+test7  <- train[ train_folded$Fold7,]
+train8 <- train[-train_folded$Fold8,]
+test8  <- train[ train_folded$Fold8,]
+
+testaccuracy <- function(formula, ntree, nodesize, maxnodes, mtry) {
+  acc_vec <- NA
+  findacc <- function(traindata, testdata) {
+    forestmod <- suppressWarnings(randomForest(formula, data = traindata, 
+                                  ntree = ntree, nodesize = nodesize, 
+                                  maxnodes = maxnodes, mtry = mtry))
+    testdata$preds <- predict(forestmod, newdata = testdata)
+    accuracy <- sum(testdata$Survived==round(testdata$preds))/nrow(testdata)
+    return(accuracy)
+  }
+  acc_vec[1] <- findacc(train1, test1)
+  acc_vec[2] <- findacc(train2, test2)
+  acc_vec[3] <- findacc(train3, test3)
+  acc_vec[4] <- findacc(train4, test4)
+  acc_vec[5] <- findacc(train5, test5)
+  acc_vec[6] <- findacc(train6, test6)
+  acc_vec[7] <- findacc(train7, test7)
+  acc_vec[8] <- findacc(train8, test8)
+  return(mean(acc_vec))
+}
+
+(model1 <- testaccuracy(Survived ~ ., ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+```
+
+5. Improve model - several iterations
+
+```{r CV variable selection}
+# Cross-validate for variable selection
+formula1 <- Survived ~ .
+formula2 <- Survived ~ Pclass + Name + Sex + Age + SibSp + Parch + Ticket + 
+                       Fare + Cabin + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers + ticket.letters
+formula3 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + Ticket + 
+                       Fare + Cabin + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers + ticket.letters
+formula4 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                       Fare + Cabin + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers + ticket.letters
+formula5 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                       Fare + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers + ticket.letters
+formula6 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                       Fare + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers
+formula7 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                       Fare + Embarked + title + lastname + cabinct + 
+                       cabin.first
+formula8 <- Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                       Fare + Embarked + title + lastname + cabinct
+formula9 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + 
+                       Fare + Embarked + title + cabinct
+formula10 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + 
+                       Fare + Embarked + title + lastname + cabinct + 
+                       cabin.first + ticket.numbers + ticket.letters
+
+(model1 <- testaccuracy(formula1, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model2 <- testaccuracy(formula2, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model3 <- testaccuracy(formula3, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model4 <- testaccuracy(formula4, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model5 <- testaccuracy(formula5, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model6 <- testaccuracy(formula6, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model7 <- testaccuracy(formula7, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model8 <- testaccuracy(formula8, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model9 <- testaccuracy(formula9, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(model10 <- testaccuracy(formula10, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+
+# Formula 9 resulted in highest accuracy - try again with variations on this formula (now formula A)
+formulaA <- Survived ~ Pclass + Sex:Age + SibSp + Parch + 
+                       Fare + Embarked + title + cabinct
+formulaB <- Survived ~ Pclass:Sex + Age + SibSp + Parch + 
+                       Fare + Embarked + title + cabinct
+formulaC <- Survived ~ Pclass + Sex:Age + SibSp:Parch + 
+                       Fare + Embarked + title + cabinct
+formulaD <- Survived ~ Pclass:title + Sex:Age + SibSp + Parch + 
+                       Fare + Embarked + cabinct
+formulaE <- Survived ~ Pclass:cabinct + Sex:Age + SibSp + Parch + 
+                       Fare + Embarked + title
+formulaF <- Survived ~ Pclass:cabinct + Sex:Age + SibSp:Parch + 
+                       Fare + Embarked + title
+formulaG <- Survived ~ Pclass + Sex:Age + SibSp + Parch + 
+                       Fare + title + cabinct
+formulaH <- Survived ~ Pclass + Sex:Age + SibSp + Parch + 
+                       Fare + title + cabinct + cabin.first
+
+(modelA <- testaccuracy(formulaA, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelB <- testaccuracy(formulaB, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelC <- testaccuracy(formulaC, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelD <- testaccuracy(formulaD, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelE <- testaccuracy(formulaE, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelF <- testaccuracy(formulaF, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelG <- testaccuracy(formulaG, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+(modelH <- testaccuracy(formulaH, ntree = 100, nodesize = 5, 
+                        maxnodes = NULL, mtry = 3))
+# High accuracy results, not a lot of variation. Continue with formula A for now.
+```
+
+```{r CV ntree}
+ntree_acc <- NA
+ntree_vec <- seq(100, 900, length=5)
+for (i in 1:length(ntree_vec)) {
+  print(i)
+  ntree_acc[i] <- testaccuracy(formulaA, ntree = ntree_vec[i], nodesize = 5, 
+                               maxnodes = NULL, mtry = 3)
+}
+plot(ntree_acc)
+
+# Go with ntree=300
+```
+
+```{r CV nodesize}
+nodesize_acc <- NA
+nodesize_vec <- seq(1, 9, length=9)
+for (i in 1:length(nodesize_vec)) {
+  print(i)
+  nodesize_acc[i] <- testaccuracy(formulaA, ntree = 300, nodesize = nodesize_vec[i], 
+                                  maxnodes = NULL, mtry = 3)
+}
+plot(nodesize_acc)
+
+# Go with nodesize = 3
+```
+
+```{r CV maxnodes}
+maxnodes_acc <- NA
+maxnodes_vec <- c(seq(1, 100, length = 10), 100, NULL)
+for (i in 1:length(maxnodes_vec)) {
+  print(i)
+  maxnodes_acc[i] <- testaccuracy(formulaA, ntree = 300, nodesize = 3, 
+                                  maxnodes = maxnodes_vec[i], mtry = 3)
+}
+plot(maxnodes_acc)
+
+# Go with maxnodes = 100
+```
+
+```{r CV mtry}
+mtry_acc <- NA
+mtry_vec <- seq(1, 10, length = 10)
+for (i in 1:length(mtry_vec)) {
+  print(i)
+  mtry_acc[i] <- testaccuracy(formulaA, ntree = 300, nodesize = 3, 
+                              maxnodes = 100, mtry = mtry_vec[i])
+}
+plot(mtry_acc)
+
+# Go with mtry = 5
+```
+
+```{r Compare default to developed model}
+(devmod <- testaccuracy(formulaA, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+(defmod <- testaccuracy(Survived ~ ., ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+# Developed model more accurate than default model
+
+formA.1 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + Embarked + title + cabinct
+formA.2 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + Embarked + title + cabinct + lastname
+formA.3 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + Embarked + title + cabinct + cabin.first
+formA.4 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + Embarked + title + cabinct + ticket.letters
+formA.5 <- Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + Embarked + title + cabinct + ticket.numbers
+
+(devmod.1 <- testaccuracy(formA.1, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+(devmod.2 <- testaccuracy(formA.2, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+(devmod.3 <- testaccuracy(formA.3, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+(devmod.4 <- testaccuracy(formA.4, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+(devmod.5 <- testaccuracy(formA.5, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+
+formfinal <- Survived ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked + 
+                        title + cabinct + ticket.numbers
+(modfinal <- testaccuracy(formfinal, ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5))
+```
+
+6. Prepare test data for predictions
+
+```{r Prep test data}
+# Prep for imputation
+test$Embarked <- as.factor(test$Embarked)
+test$Sex <- as.factor(test$Sex)
+
+# Impute missing age and embarkment data
+imputation <- mice(data = test[,c(2:9,11)], m = 1, method = c(rep("cart", 9)))
+test[,c(2:9,11)] <- complete(imputation)
+
+# Separate out name variable into parts
+test$title <- as.factor(str_extract(test$Name, "\\w+\\."))
+levels(test$title)
+test$title <- revalue(test$title, c("Dona." = "Don."))
+test$lastname <- str_extract(test$Name, "\\w*")
+length(unique(test$lastname))
+
+# Create new cabin variable - count the number listed (0 for NA)
+test$cabinct <- lengths(strsplit(test$Cabin, " "))
+test$cabinct <- ifelse(is.na(test$Cabin), 0, test$cabinct)
+
+# Create variable for first letter of cabin assignment
+test$cabin.first <- str_extract(test$Cabin, "[A-Z]")
+
+# Split ticket names into letters/prefix and numbers
+test$ticket.letters <- str_extract(test$Ticket, "\\D*")
+test$ticket.letters <- ifelse(test$ticket.letters=="", NA, test$ticket.letters)
+test$ticket.numbers <- str_extract(test$Ticket, "\\d*")
+test$ticket.numbers <- ifelse(test$ticket.numbers=="", 
+                               str_extract(test$Ticket, "\\s\\d*"), 
+                               test$ticket.numbers)
+test$ticket.numbers <- str_trim(test$ticket.numbers, side = "left")
+test$ticket.numbers <- as.numeric(test$ticket.numbers)
+
+# Remove NAs from test data
+test$Cabin <- ifelse(is.na(test$Cabin), "X", test$Cabin)
+test$cabin.first <- ifelse(is.na(test$cabin.first), "X", test$cabin.first)
+test$ticket.letters <- ifelse(is.na(test$ticket.letters), "X", test$ticket.letters)
+test$ticket.numbers <- ifelse(is.na(test$ticket.numbers), 000, test$ticket.numbers)
+
+# Make sure factor variable levels align
+test$Embarked <- factor(test$Embarked, levels = levels(train$Embarked))
+test$title <- factor(test$title, levels = levels(train$title))
+```
+
+7. Make predictions and finalize submission dataset
+
+```{r Predict on test data}
+rfmodel <- randomForest(Survived ~ Pclass + Sex:Age + SibSp + Parch + Fare + 
+                        Embarked + title + cabinct + ticket.numbers,
+                        ntree = 300, nodesize = 3, maxnodes = 100, mtry = 5,
+                        data = train)
+varImpPlot(rfmodel, main = "Final random forest model variable importance plot")
+test$Survived <- round(predict(rfmodel, newdata = test))
+
+test <- test[,c("PassengerId", "Survived")]
+write_csv(test, "Finn_TitanicPredictions.csv")
+```
+
